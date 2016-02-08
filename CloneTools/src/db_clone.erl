@@ -23,7 +23,6 @@
 -define(REMOVE_KEYS, [<<"_rev">>, <<"_attachments">>]).
 -define(MAX_BULK, 100).
 -define(MAX_WORKERS, 1).
--define(ID_BULK, 1000).
 
 run() ->
     inets:start(),
@@ -40,11 +39,9 @@ run() ->
 
 run(["-s", Source | Rest]) ->
     os:putenv("SOURCE", Source),
-    io:format("~s~n",[Source]),
     run(Rest);
 run(["-t", Target | Rest]) ->
     os:putenv("TARGET", Target),
-    io:format("~s~n",[Target]),
     run(Rest);
 run(["-e", "modb" | Rest]) ->
     os:putenv("EXCLUDE", "^account.*-\\d{6}$"),
@@ -164,12 +161,10 @@ clone_account_db(Db) ->
 
 clone_all_docs(Db, Startkey) ->
   case find_missing_ids(Db, Startkey) of
-    {Ids, SourceIdsLenth, _}
-      when length(Ids) =:= 0
-      andalso SourceIdsLenth < ?ID_BULK ->
+    {Ids, SourceIdsLenth, _}  when length(Ids) =:= 0
+                              andalso SourceIdsLenth < ?MAX_BULK ->
       ?LOG_GREEN("  documents are in sync~n", []);
-    {Ids, SourceIdsLenth, _}
-      when SourceIdsLenth < ?ID_BULK  ->
+    {Ids, SourceIdsLenth, _} when SourceIdsLenth < ?MAX_BULK  ->
       ?LOG_CYAN("  found ~p missing documents ~n"
         ,[length(Ids)]),
       clone_docs(Ids, Db, 'true');
@@ -183,12 +178,12 @@ clone_all_docs(Db, Startkey) ->
 find_missing_ids(Db, Startkey) ->
   Path = case Startkey =:= <<"">> of
            'true' -> lists:concat(["_all_docs?limit="
-                                   , integer_to_list(?ID_BULK)
+                                   , integer_to_list(?MAX_BULK)
                                   ]);
            'false' -> lists:concat(["_all_docs?startkey=\""
                                     , binary_to_list(Startkey)
                                     , "\"&limit="
-                                    , integer_to_list(?ID_BULK)
+                                    , integer_to_list(?MAX_BULK)
                                    ])
          end,
   io:format("Path: ~s~n",[Path]),
@@ -199,9 +194,13 @@ find_missing_ids(Db, Startkey) ->
   Ids = sets:to_list(sets:subtract(sets:from_list(SourceIds)
                      ,sets:from_list(TargetIds))
                     ),
+  LastId = case length(SourceIds) > 0 of
+             'true' -> lists:last(SourceIds);
+             'false' -> <<"">>
+           end,
   {Ids
    ,length(SourceIds)
-   ,lists:last(SourceIds)
+   ,LastId
   }.
 
 clone_design_docs(Db) ->
