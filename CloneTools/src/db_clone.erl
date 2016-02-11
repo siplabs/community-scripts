@@ -21,7 +21,7 @@
                ,{<<"views">>, wh_json:from_list(?VIEWS)}
               ]).
 -define(REMOVE_KEYS, [<<"_rev">>, <<"_attachments">>]).
--define(MAX_BULK, 100).
+-define(MAX_BULK, 10).
 -define(MAX_WORKERS, 1).
 
 run() ->
@@ -137,7 +137,7 @@ clone_db(Db) ->
         'false' -> 'ok';
         'true' ->
             put('errors', []),
-            _ = clone_all_docs(Db, <<"">>),
+            _ = clone_all_docs(Db),
             %% _ = clone_attachments(Db),
             [?LOG_RED("~s", [Error])
              || Error <- get('errors')
@@ -159,34 +159,41 @@ clone_account_db(Db) ->
             ]
     end.
 
-clone_all_docs(Db, Startkey) ->
-  case find_missing_ids(Db, Startkey) of
-    {Ids, SourceIdsLenth, _}  when length(Ids) =:= 0
-                              andalso SourceIdsLenth < ?MAX_BULK ->
-      ?LOG_GREEN("  documents are in sync~n", []);
-    {Ids, SourceIdsLenth, _} when SourceIdsLenth < ?MAX_BULK  ->
-      ?LOG_CYAN("  found ~p missing documents ~n"
-        ,[length(Ids)]),
-      clone_docs(Ids, Db, 'true');
+clone_all_docs(Db) ->
+  LogGreen = "  documents are in sync~n",
+  LogCyan = "  found ~p missing documents ~n",
+  universal_clone_docs(Db, <<"">>, fun find_missing_ids/2, LogGreen, LogCyan, 'true').
+
+universal_clone_docs(Db, StartKey, IdFinder, LogGreen, LogCyan, BulkClone) ->
+  case IdFinder(Db, StartKey) of
+    {Ids, 'last_bulk', _}  when length(Ids) =:= 0 ->
+        ?LOG_GREEN(LogGreen, []);
+    {Ids, 'last_bulk', _} ->
+        ?LOG_CYAN(LogCyan, [length(Ids)]),
+        clone_docs(Ids, Db, BulkClone);
     {Ids, _, NextStartKey} ->
-      ?LOG_CYAN("  found ~p missing documents ~n"
-        ,[length(Ids)]),
-      clone_docs(Ids, Db, 'true'),
-      clone_all_docs(Db, NextStartKey)
+        ?LOG_CYAN(LogCyan, [length(Ids)]),
+        clone_docs(Ids, Db, BulkClone),
+        universal_clone_docs(Db, NextStartKey, IdFinder, LogGreen, LogCyan, BulkClone)
   end.
 
 find_missing_ids(Db, Startkey) ->
+    FirstRequest = "_all_docs?limit=",
+    StartkeyRequest = "_all_docs?startkey=\"",
+    LimitRequest = "\"&limit=",
+    bulk_find_ids(Db, Startkey, FirstRequest, StartkeyRequest, LimitRequest).
+
+bulk_find_ids(Db, Startkey, FirstRequest, StartKeyRequest, LimitRequest) ->
   Path = case Startkey =:= <<"">> of
-           'true' -> lists:concat(["_all_docs?limit="
-                                   , integer_to_list(?MAX_BULK)
-                                  ]);
-           'false' -> lists:concat(["_all_docs?startkey=\""
-                                    , binary_to_list(Startkey)
-                                    , "\"&limit="
-                                    , integer_to_list(?MAX_BULK)
-                                   ])
+             'true' -> lists:concat([FirstRequest
+                                     ,integer_to_list(?MAX_BULK)
+                                    ]);
+             'false' -> lists:concat([StartKeyRequest
+                                      ,binary_to_list(Startkey)
+                                      ,LimitRequest
+                                      ,integer_to_list(?MAX_BULK)
+                                     ])
          end,
-  io:format("Path: ~s~n",[Path]),
   Source = source_request([Db, Path]),
   Target = target_request([Db, Path]),
   SourceIds = get_ids(Source),
@@ -195,92 +202,142 @@ find_missing_ids(Db, Startkey) ->
                      ,sets:from_list(TargetIds))
                     ),
   LastId = case length(SourceIds) > 0 of
-             'true' -> lists:last(SourceIds);
-             'false' -> <<"">>
+                'true' -> lists:last(SourceIds);
+                'false' -> <<"">>
            end,
-  {Ids
-   ,length(SourceIds)
-   ,LastId
-  }.
+  BulkType = case length(SourceIds) =:= ?MAX_BULK of
+                  'true' -> 'regular_bulk';
+                  'false' -> 'last_bulk'
+             end,
+  {Ids, BulkType, LastId}.
 
 clone_design_docs(Db) ->
     _ = put_clone_view(Db),
-    case find_missing_design_ids(Db) of
-        [] -> ?LOG_GREEN("  design documents are in sync~n", []);
-        Ids ->
-            ?LOG_CYAN("  found ~p missing design documents~n"
-                      ,[length(Ids)]),
-            clone_docs(Ids, Db, 'true')
-    end.
+    LogGreen = "  design documents are in sync~n",
+    LogCyan = "  found ~p missing design documents~n",
+    universal_clone_docs(Db, <<"">>, fun find_missing_design_ids/2, LogGreen, LogCyan, 'true').
 
-find_missing_design_ids(Db) ->
-    Source = source_request([Db
-                             ,<<"_all_docs?startkey=\"_design/\"&endkey=\"_design0\"">>
-                            ]),
-    Target = target_request([Db
-                             ,<<"_all_docs?startkey=\"_design/\"&endkey=\"_design0\"">>
-                            ]),
-    SourceIds = sets:from_list(get_ids(Source)),
-    TargetIds = sets:from_list(get_ids(Target)),
-    sets:to_list(sets:subtract(SourceIds, TargetIds)).
+find_missing_design_ids(Db, Startkey) ->
+    FirstRequest = "_all_docs?startkey=\"_design/\"&endkey=\"_design0\"&limit=",
+    StartkeyRequest = "_all_docs?startkey=\"",
+    LimitRequest = "\"&endkey=\"_design0\"&limit=",
+    bulk_find_ids(Db, Startkey, FirstRequest, StartkeyRequest, LimitRequest).
 
 clone_filtered_docs(Db) ->
-    case find_missing_filtered_ids(Db) of
-        [] -> ?LOG_GREEN("  filtered documents are in sync~n", []);
-        Ids ->
-            ?LOG_CYAN("  found ~p missing filtered documents~n"
-                      ,[length(Ids)]),
-            clone_docs(Ids, Db, 'false')
+    LogGreen = "  filtered are in sync~n",
+    LogCyan = "  found ~p missing filtered documents ~n",
+    universal_clone_docs(Db, <<"">>, fun find_missing_filtered_ids/2, LogGreen, LogCyan, 'false').
+
+find_missing_filtered_ids(Db, Startkey) ->
+    FirstRequest = "_design/clone/_view/filtered_ids?limit=",
+    StartkeyRequest = "_design/clone/_view/filtered_ids?startkey=\"",
+    LimitRequest = "\"&limit=",
+    bulk_find_ids(Db, Startkey, FirstRequest, StartkeyRequest, LimitRequest).
+
+
+%%clone_attachments(Db) ->
+%%    case find_missing_attachments(Db) of
+%%        [] -> ?LOG_GREEN("  attachments are in sync~n", []);
+%%        Ids ->
+%%            ?LOG_CYAN("  found ~p missing attachments~n"
+%%                      ,[length(Ids)]),
+%%            maybe_copy_attachments(Ids, Db)
+%%    end.
+
+clone_attachments(Db) -> clone_attachments(Db, <<"">>).
+
+clone_attachments(Db, StartKey) ->
+    LogGreen = "  attachments are in sync~n",
+    LogCyan = "  found ~p missing attachments~n",
+    case find_missing_attachments(Db, StartKey) of
+        {Ids, 'last_bulk', _}  when length(Ids) =:= 0 ->
+            ?LOG_GREEN(LogGreen, []);
+        {Ids, 'last_bulk', _} ->
+            ?LOG_CYAN(LogCyan, [length(Ids)]),
+            maybe_copy_attachments(Ids, Db);
+        {Ids, _, NextStartKey} ->
+            ?LOG_CYAN(LogCyan, [length(Ids)]),
+            maybe_copy_attachments(Ids, Db),
+            clone_attachments(Db, NextStartKey)
     end.
 
-find_missing_filtered_ids(Db) ->
-    Source = source_request([Db
-                             ,<<"_design/clone/_view/filtered_ids">>
-                            ]),
-    Target = target_request([Db
-                             ,<<"_design/clone/_view/filtered_ids">>
-                            ]),
-    SourceIds = sets:from_list(get_ids(Source)),
-    TargetIds = sets:from_list(get_ids(Target)),
-    sets:to_list(sets:subtract(SourceIds, TargetIds)).
-
-clone_attachments(Db) ->
-    case find_missing_attachments(Db) of
-        [] -> ?LOG_GREEN("  attachments are in sync~n", []);
-        Ids ->
-            ?LOG_CYAN("  found ~p missing attachments~n"
-                      ,[length(Ids)]),
-            maybe_copy_attachments(Ids, Db)
-    end.
-
-find_missing_attachments(Db) ->
-    Source = source_request([Db
-                             ,<<"_design/clone/_view/has_attachments?reduce=true&group=true">>
-                            ]),
-    Target = target_request([Db
-                             ,<<"_design/clone/_view/has_attachments?reduce=true&group=true">>
-                            ]),
+find_missing_attachments(Db, Startkey) ->
+    Path = case Startkey =:= <<"">> of
+               'true' -> lists:concat(["_design/clone/_view/has_attachments?reduce=true&group=true&limit="
+                                       ,integer_to_list(?MAX_BULK)
+                                      ]);
+               'false' -> lists:concat(["_design/clone/_view/has_attachments?reduce=true&group=true&startkey=\""
+                                        ,binary_to_list(Startkey)
+                                        ,"\"&limit="
+                                        ,integer_to_list(?MAX_BULK)
+                                       ])
+           end,
+    Source = source_request([Db, Path]),
+    Target = target_request([Db, Path]),
+    SourceIds = get_ids(Source),
     TargetIds = get_ids(Target),
-    lists:foldl(fun({Id, Length}, Ids) ->
-                        case props:get_value(Id, TargetIds) =/= Length of
-                            'true' -> [Id|Ids];
-                            'false' -> Ids
-                        end
-                end, [], get_ids(Source)).
+    UniqueAttachmentsIds = lists:foldl(fun({Id, Length}, Ids) ->
+                                            case props:get_value(Id, TargetIds) =/= Length of
+                                                'true' -> [Id|Ids];
+                                                'false' -> Ids
+                                            end
+                                       end, [], SourceIds),
+    LastId = case length(SourceIds) > 0 of
+                 'true' ->
+                     {Id, _ } = lists:last(SourceIds),
+                     Id;
+                 'false' -> <<"">>
+             end,
+    BulkType = case length(SourceIds) =:= ?MAX_BULK of
+                   'true' -> 'regular_bulk';
+                   'false' -> 'last_bulk'
+               end,
+    {UniqueAttachmentsIds, BulkType, LastId}.
+
+%%find_missing_attachments(Db) ->
+%%    Source = source_request([Db
+%%                             ,<<"_design/clone/_view/has_attachments?reduce=true&group=true">>
+%%                            ]),
+%%    Target = target_request([Db
+%%                             ,<<"_design/clone/_view/has_attachments?reduce=true&group=true">>
+%%                            ]),
+%%    TargetIds = get_ids(Target),
+%%    lists:foldl(fun({Id, Length}, Ids) ->
+%%                        case props:get_value(Id, TargetIds) =/= Length of
+%%                            'true' -> [Id|Ids];
+%%                            'false' -> Ids
+%%                        end
+%%                end, [], get_ids(Source)).
 
 clone_voicemail_boxes(Db) ->
-    case find_missing_voicemail_boxes(Db) of
-        [] -> ?LOG_GREEN("  no voicemail boxes found~n", []);
-        Ids -> ?LOG_CYAN("  found ~p voicemail boxes~n"
-                         ,[length(Ids)]),
-               clone_docs(Ids, Db, 'false')
-    end.
+  LogGreen = "  no voicemail boxes found~n",
+  LogCyan = "  found ~p voicemail boxes~n",
+  universal_clone_docs(Db, <<"">>, fun find_missing_voicemail_boxes/2, LogGreen, LogCyan, 'false').
 
-find_missing_voicemail_boxes(Db) ->
-    Source = source_request([Db
-                             ,<<"_design/clone/_view/vmbox_ids">>
-                            ]),
-    get_ids(Source).
+find_missing_voicemail_boxes(Db, Startkey) ->
+    Path = case Startkey =:= <<"">> of
+               'true' -> lists:concat(["_design/clone/_view/vmbox_ids?limit="
+                                       ,integer_to_list(?MAX_BULK)
+                                      ]);
+               'false' -> lists:concat(["_design/clone/_view/vmbox_ids?startkey=\""
+                                        ,binary_to_list(Startkey)
+                                        ,"\"&limit="
+                                        ,integer_to_list(?MAX_BULK)
+                                       ])
+           end,
+    Source = source_request([Db, Path]),
+    SourceIds = get_ids(Source),
+    {LastId, Ids} = case length(SourceIds) > 0 of
+                        'true' when  Startkey =:= <<"">> ->
+                            {lists:last(SourceIds), SourceIds};
+                        'true' -> {lists:last(SourceIds), tl(SourceIds)};
+                        'false' -> {<<"">>, []}
+                    end,
+    BulkType = case length(SourceIds) =:= ?MAX_BULK of
+                   'true' -> 'regular_bulk';
+                   'false' -> 'last_bulk'
+               end,
+    {Ids, BulkType, LastId}.
 
 roll_up_credit(Db) ->
     SourceCredit = get_source_credit(Db),
